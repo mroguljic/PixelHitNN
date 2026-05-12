@@ -33,6 +33,8 @@ class Trainer:
         self.model_dest = self.config.get(f"model_dest_{axis}", f"checkpoints/{self.layer}_{self.axis}.keras")
         self.debug_predictions = bool(self.config.get("debug_predictions", False))
         self.input_file = self.config.get("input_file")
+        self.output_scale = self.config.get("output_scale")
+        self.first_guess = self.config.get("first_guess")
         self.input_prepared = False
         self.model = None
 
@@ -116,7 +118,7 @@ class Trainer:
                 "ClusterCenter_x", "ClusterCenter_y",
                 "Cluster_charge",
                 "Cluster", "Cluster_x", "Cluster_y",
-                "SimHit_x", "SimHit_y",
+                "SimHit_x", "SimHit_y", "Generic_x", "Generic_y"
             ]
             print(f"Reading {len(needed_branches)} branches from {tree.num_entries} entries...")
             data = tree.arrays(needed_branches, library="np")
@@ -135,11 +137,13 @@ class Trainer:
         cluster_2d    = apply("Cluster")       # 2-D pixel array (jagged or fixed shape)
         cluster_x     = apply("Cluster_x")     # x projection (1-D strip)
         cluster_y     = apply("Cluster_y")     # y projection (1-D strip)
-        center_x      = apply("ClusterCenter_x")
-        center_y      = apply("ClusterCenter_y")
+        center_x      = apply("ClusterCenter_x") * self.output_scale 
+        center_y      = apply("ClusterCenter_y") * self.output_scale 
         cluster_charge = apply("Cluster_charge")
-        simhit_x      = apply("SimHit_x")
-        simhit_y      = apply("SimHit_y")
+        simhit_x      = apply("SimHit_x") * self.output_scale 
+        simhit_y      = apply("SimHit_y") * self.output_scale 
+        generic_x      = apply("Generic_x") * self.output_scale 
+        generic_y      = apply("Generic_y") * self.output_scale 
 
         print("\n--- Sanity check: Print properties of first 5 clusters ---")
         n_check = min(5, n_total)
@@ -164,6 +168,7 @@ class Trainer:
 
         # --- Train / test split ---
         np.random.seed(seed)
+        tf.keras.utils.set_random_seed(seed)
         perm = np.random.permutation(n_total)
         n_train = int(n_total * train_split)
 
@@ -180,6 +185,8 @@ class Trainer:
         self.cluster_charge_train, self.cluster_charge_test = split(cluster_charge)
         self.simhit_x_train,       self.simhit_x_test       = split(simhit_x)
         self.simhit_y_train,       self.simhit_y_test       = split(simhit_y)
+        self.generic_x_train,       self.generic_x_test       = split(generic_x)
+        self.generic_y_train,       self.generic_y_test       = split(generic_y)
 
         print(f"Train / test split: {n_train} / {n_total - n_train} clusters")
         self.input_prepared = True
@@ -200,6 +207,8 @@ class Trainer:
 
         center_train = np.asarray(self.center_x_train if self.axis == "x" else self.center_y_train, dtype=np.float32).reshape(-1, 1)
         center_test = np.asarray(self.center_x_test if self.axis == "x" else self.center_y_test, dtype=np.float32).reshape(-1, 1)
+        generic_train = np.asarray(self.generic_x_train if self.axis == "x" else self.generic_y_train, dtype=np.float32).reshape(-1, 1)
+        generic_test = np.asarray(self.generic_x_test if self.axis == "x" else self.generic_y_test, dtype=np.float32).reshape(-1, 1)
         if self.axis == "x":
             simhit_train = self._first_simhit_per_event(self.simhit_x_train, "SimHit_x_train")
             simhit_test = self._first_simhit_per_event(self.simhit_x_test, "SimHit_x_test")
@@ -208,9 +217,13 @@ class Trainer:
             simhit_test = self._first_simhit_per_event(self.simhit_y_test, "SimHit_y_test")
 
         # Final hit position is cluster center + NN prediction, so we train the NN to predict the offset from the cluster center to the SimHit position.
-        target_offset_train = simhit_train - center_train
-        target_offset_test = simhit_test - center_test
-
+        if self.first_guess == "center":
+            target_offset_train = simhit_train - center_train
+            target_offset_test = simhit_test - center_test
+        elif self.first_guess == "generic":
+            target_offset_train = simhit_train - generic_train
+            target_offset_test = simhit_test - generic_test
+        print(np.mean(target_offset_test), np.std(target_offset_test))
         input_len = x_train.shape[1]
 
         #13(21) pixels in x(y) + 2 angles + 1 charge = 16(24) input features for x(y) projection
@@ -219,7 +232,6 @@ class Trainer:
         inputs = tf.keras.layers.Input(shape=(input_len, 1), name=f"pixel_projection_{self.axis}")
         angles = tf.keras.layers.Input(shape=(2,), name="angles")
         charges = tf.keras.layers.Input(shape=(1,), name="cluster_charge")
-
         model_fn = getattr(architectures, self.modelname)
         model = model_fn(inputs, angles, charges, input_dim)
         loss_func = getattr(losses, self.loss_name)
@@ -247,6 +259,12 @@ class Trainer:
                     save_freq="epoch",
                 )
             )
+        early_stop = tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            patience=10,
+            restore_best_weights=True
+        )
+        callbacks.append(early_stop)
 
         history = model.fit(
             [x_train[:, :, np.newaxis], angles_train, charge_train],
@@ -276,9 +294,12 @@ class Trainer:
         self.train_uncertainty_pred = pred_train[:, 1:2]
         self.test_uncertainty_pred = pred_test[:, 1:2]
 
-        self.train_simhit_pred = center_train + self.train_offset_pred
-        self.test_simhit_pred = center_test + self.test_offset_pred
-
+        if self.first_guess == "center":
+            self.train_simhit_pred = center_train + self.train_offset_pred
+            self.test_simhit_pred = center_test + self.test_offset_pred
+        elif self.first_guess == "generic":
+            self.train_simhit_pred = generic_train + self.train_offset_pred
+            self.test_simhit_pred = generic_test + self.test_offset_pred
         self.model = model
         self.history = history
         self.train_target_offset = target_offset_train
@@ -301,19 +322,22 @@ class Trainer:
         charge_test = np.asarray(self.cluster_charge_test, dtype=np.float32).reshape(-1, 1)
 
         center_test = np.asarray(self.center_x_test if self.axis == "x" else self.center_y_test, dtype=np.float32).reshape(-1, 1)
+        generic_test = np.asarray(self.generic_x_test if self.axis == "x" else self.generic_y_test, dtype=np.float32).reshape(-1, 1)
         if self.axis == "x":
             simhit_test = self._first_simhit_per_event(self.simhit_x_test, "SimHit_x_test")
         else:
             simhit_test = self._first_simhit_per_event(self.simhit_y_test, "SimHit_y_test")
 
-        target_offset_test = simhit_test - center_test
-
+        if self.first_guess == "center":
+            target_offset_test = simhit_test - center_test
+        elif self.first_guess == "generic":
+            target_offset_test = simhit_test - generic_test
         pred = self.model.predict([x_test[:, :, np.newaxis], angles_test, charge_test], batch_size=self.batch_size, verbose=0)
         self.pred = pred
 
         residuals_native = pred[:, 0] - target_offset_test[:, 0] # native == in cm
         uncertainty_native = pred[:, 1]
-        conversion_to_microns = 1e4
+        conversion_to_microns = 1e4 / self.output_scale
 
         residuals = residuals_native * conversion_to_microns
         uncertainties = uncertainty_native * conversion_to_microns
@@ -332,12 +356,12 @@ class Trainer:
         print("Pulls mean and std: {:.3f} +/- {:.3f}".format(float(np.mean(pulls)), float(np.std(pulls))))
 
         os.makedirs("plots", exist_ok=True)
-        residuals_output_file = f"plots/{self.layer}_{self.axis}_residuals.pdf"
-        pulls_output_file = f"plots/{self.layer}_{self.axis}_pulls.pdf"
-        plot_name = f"{self.layer}_{self.axis}"
+        residuals_output_file = f"plots/NNwith{self.first_guess}_{self.layer}_{self.axis}_residuals.pdf"
+        pulls_output_file = f"plots/NNwith{self.first_guess}_{self.layer}_{self.axis}_pulls.pdf"
+        plot_name = f"NNwith{self.first_guess}_{self.layer}_{self.axis}"
         plotting.plot_residuals(residuals, residuals_output_file, plot_type="Residuals", name=plot_name)
         plotting.plot_residuals(pulls, pulls_output_file, plot_type="Pulls", name=plot_name)
-        plotting.plot_uncertainties(uncertainties, f"plots/{self.layer}_{self.axis}_uncertainties.pdf")
+        plotting.plot_uncertainties(uncertainties, f"plots/NNwith{self.first_guess}_{self.layer}_{self.axis}_uncertainties.pdf")
 
     def visualize(self, n_to_plot=10):
         if not self.input_prepared:
@@ -353,18 +377,24 @@ class Trainer:
             self.center_x_test if self.axis == "x" else self.center_y_test,
             dtype=np.float32,
         ).reshape(-1, 1)
+        generic_test = np.asarray(
+            self.generic_x_test if self.axis == "x" else self.generic_y_test,
+            dtype=np.float32,
+        ).reshape(-1, 1)
         if self.axis == "x":
             simhit_test = self._first_simhit_per_event(self.simhit_x_test, "SimHit_x_test")
         else:
             simhit_test = self._first_simhit_per_event(self.simhit_y_test, "SimHit_y_test")
-
-        target_offset_test = (simhit_test - center_test) * 1e4
-        pred_offset_test = self.pred[:, 0] * 1e4
-        pred_uncertainty_test = self.pred[:, 1] * 1e4
+        if self.first_guess == "center":
+            target_offset_test = (simhit_test - center_test) * 1e4 / self.output_scale 
+        elif self.first_guess == "generic":
+            target_offset_test = (simhit_test - generic_test) * 1e4 / self.output_scale
+        pred_offset_test = self.pred[:, 0] * 1e4 / self.output_scale
+        pred_uncertainty_test = self.pred[:, 1] * 1e4 / self.output_scale
 
         n_to_plot = min(n_to_plot, len(x_test))
         plotting_data_sets = []
-        plotting_file_name = f"plots/{self.layer}_{self.axis}.pdf"
+        plotting_file_name = f"plots/NNwith{self.first_guess}_{self.layer}_{self.axis}.pdf"
 
         for idx in range(n_to_plot):
             data_set = {
@@ -381,10 +411,24 @@ class Trainer:
         os.makedirs("plots", exist_ok=True)
         plotting.plot_clusters(plotting_data_sets, plotting_file_name)
 
+    def plot_otherMethods(self):
+        simhit_y = self._first_simhit_per_event(self.simhit_y_test, "SimHit_y_train")[:,0]
+        residuals_center_y = ( self.center_y_test - simhit_y ) * 1e4 / self.output_scale 
+        residuals_generic_y = ( self.generic_y_test - simhit_y ) * 1e4 / self.output_scale
+        plotting.plot_residuals(residuals_center_y, f"plots/center_{self.layer}_y_residuals.pdf" , plot_type="Residuals", name=f"center_y")
+        plotting.plot_residuals(residuals_generic_y, f"plots/generic_{self.layer}_y_residuals.pdf", plot_type="Residuals", name=f"generic_y")
+        
+        simhit_x = self._first_simhit_per_event(self.simhit_x_test, "SimHit_x_train")[:,0]
+        residuals_center_x = ( self.center_x_test - simhit_x ) * 1e4 / self.output_scale
+        residuals_generic_x = ( self.generic_x_test - simhit_x ) * 1e4 / self.output_scale
+        plotting.plot_residuals(residuals_center_x, f"plots/center_{self.layer}_x_residuals.pdf" , plot_type="Residuals", name=f"center_x")
+        plotting.plot_residuals(residuals_generic_x, f"plots/generic_{self.layer}_x_residuals.pdf", plot_type="Residuals", name=f"generic_x")
+
 
 if __name__ == "__main__":
     trainer = Trainer(layer="L1U", axis="y")
     trainer.prepare_train_test_input()
     trainer.train()
     trainer.test()
+    trainer.plot_otherMethods()
     trainer.visualize()

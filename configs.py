@@ -1,11 +1,14 @@
 common = {
     "pitch_x" : 150.0, # microns
     "pitch_y" : 100.0, # microns
-    "batch_size" : 4096,
-    "epochs" : 500,
+    "batch_size" : 256,
+    "epochs" : 5000,
     "loss_name": "nll_loss",
     "input_file": "test_clusters.root",
     "debug_predictions": False,
+    "modelname": "conv_model",
+    "output_scale": 50.,
+    "first_guess": "center", # 'center' or 'generic'
     }
 
 layer_configs = {}
